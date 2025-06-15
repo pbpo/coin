@@ -163,6 +163,7 @@ class LargeScaleTradingEnv(gym.Env):
             for name in self.coin_names:
                 if self.positions[name]['type'] != 0:
                     realized_pnl += self._close_position(name, current_prices[name])
+            previous_portfolio_value += realized_pnl
 
         # 시간 한 스텝 이동
         self.index += 1
@@ -172,6 +173,7 @@ class LargeScaleTradingEnv(gym.Env):
         current_portfolio_value = self._get_current_portfolio_value(next_prices)
         step_return = (current_portfolio_value / previous_portfolio_value) - 1.0
         self.portfolio_returns_history.append(step_return)
+        self.portfolio_value = current_portfolio_value
 
         # Sharpe Ratio 보상 계산
         if len(self.portfolio_returns_history) < self.reward_window:
