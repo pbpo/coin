@@ -1,119 +1,159 @@
 #ifndef ATTENTION_HIP_HPP
 #define ATTENTION_HIP_HPP
 
-#include "common_hip.hpp"
-#include "nn_layers_hip.hpp" // For DenseLayer, Dropout, LayerNorm and their caches
-#include "bert_components_hip.hpp" // For full BertConfig definition
+#include "common_hip.hpp"          // GpuTensor, Parameter 등 공통 데이터 구조 포함
+#include "nn_layers_hip.hpp"       // DenseLayer, Dropout, LayerNorm 등 신경망 계층 포함
+#include "bert_components_hip.hpp" // BertConfig 등 BERT 구성 요소 포함
+#include <vector>
+#include <string>
 
-// No need to forward declare BertConfig if included above
+// --- 어텐션 계층을 위한 캐시(Cache) 구조체 정의 ---
+// 역전파 계산 시 필요한 중간 값들을 저장하기 위한 구조체입니다.
 
-// --- Cache Structs for Attention Layers ---
-
+/**
+ * @struct SelfAttentionCache
+ * @brief BertSelfAttention 계층의 순전파 과정에서 생성되는 중간 텐서들을 저장합니다.
+ * 이 값들은 역전파 시 그래디언트 계산에 재사용됩니다.
+ */
 struct SelfAttentionCache {
-    // Inputs to SelfAttention (stored by pointer for backward pass)
-    const GpuTensor* input_hidden_states = nullptr; // Shape: (batch_size, seq_len, hidden_size)
-    const GpuTensor* attention_mask = nullptr;    // Shape: (batch_size, 1, 1, seq_len) or (B, S, S) etc.
+    // 순전파 입력 텐서들의 포인터
+    const GpuTensor* input_hidden_states = nullptr; // 입력 텐서 (B, S, H)
+    const GpuTensor* attention_mask = nullptr;    // 어텐션 마스크 텐서
 
-    // Intermediate tensors computed during forward
-    GpuTensor q_proj; // Query projection: (B, S, H)
-    GpuTensor k_proj; // Key projection: (B, S, H)
-    GpuTensor v_proj; // Value projection: (B, S, H)
+    // 순전파 과정에서 계산되는 중간 텐서들
+    GpuTensor q_proj; // Query 선형 투영 결과 (B, S, H)
+    GpuTensor k_proj; // Key 선형 투영 결과 (B, S, H)
+    GpuTensor v_proj; // Value 선형 투영 결과 (B, S, H)
 
-    GpuTensor q_reshaped; // Query reshaped for multi-head: (B, N, S, A)
-    GpuTensor k_reshaped; // Key reshaped for multi-head: (B, N, S, A)
-    GpuTensor v_reshaped; // Value reshaped for multi-head: (B, N, S, A)
+    GpuTensor q_reshaped; // Multi-head 처리를 위해 Reshape된 Query (B, N, S, A)
+    GpuTensor k_reshaped; // Multi-head 처리를 위해 Reshape된 Key (B, N, S, A)
+    GpuTensor v_reshaped; // Multi-head 처리를 위해 Reshape된 Value (B, N, S, A)
 
-    GpuTensor attention_scores; // (B, N, S_q, S_k)
-    GpuTensor attention_probs;  // (B, N, S_q, S_k), after softmax and possibly dropout
+    GpuTensor attention_scores; // 어텐션 스코어 (Q * K^T) 결과 (B, N, S, S)
+    GpuTensor attention_probs;  // Softmax와 Dropout이 적용된 어텐션 확률 (B, N, S, S)
 
-    // If attention_probs dropout is separate:
-    DropoutCache attention_probs_dropout_cache;
+    GpuTensor context_reshaped; // 어텐션 확률과 Value를 곱한 후의 Context (B, N, S, A)
+    GpuTensor context_layer;    // 최종적으로 Reshape된 Context (B, S, H)
 
-    GpuTensor context_reshaped; // Context layer reshaped: (B, N, S_q, A)
-    GpuTensor context_layer;    // Final context layer: (B, S_q, H)
-
-    // Caches for the internal DenseLayers (Q, K, V projections)
-    // These are needed if DenseLayer::backward requires its cache.
-    // The original code's DenseLayerCache was minimal (just const GpuTensor* input).
-    // Let's assume DenseLayerCache is sufficient as defined.
+    // 내부 신경망 계층들의 캐시
     DenseLayerCache q_dense_cache;
     DenseLayerCache k_dense_cache;
     DenseLayerCache v_dense_cache;
-
-    // To store pointers to the input tensors if needed by backward pass logic directly
-    // const GpuTensor* input_tensor_ptr; (already have input_hidden_states)
+    DropoutCache attention_probs_dropout_cache;
 };
 
+/**
+ * @struct BertAttentionCache
+ * @brief BertAttention 전체 모듈(Self-Attention + Self-Output)의 캐시 구조체.
+ */
 struct BertAttentionCache {
-    SelfAttentionCache self_attention_cache; // Cache for the BertSelfAttention part
-    // BertSelfOutput part cache:
-    // The output dense layer is just a DenseLayer, its cache is part of its forward call.
-    // However, we need to store the input to the output_dense layer if it's different from self_attention output.
-    // Assuming self_attention_cache.context_layer is the input to output_dense.
-    DenseLayerCache output_dense_cache;
-    DropoutCache output_dropout_cache;
-    LayerNormCache output_layernorm_cache;
+    SelfAttentionCache self_attention_cache; // BertSelfAttention 계층의 캐시
 
-    const GpuTensor* attention_input = nullptr; // Input to the whole BertAttention block (residual connection)
+    // BertSelfOutput 부분의 캐시
+    DenseLayerCache output_dense_cache;     // 출력 Dense 레이어의 캐시
+    DropoutCache output_dropout_cache;        // 출력 Dropout의 캐시
+    LayerNormCache output_layernorm_cache;    // 최종 LayerNorm의 캐시
+
+    // 잔차 연결(Residual Connection)을 위해 BertAttention 블록의 원본 입력 텐서를 저장
+    const GpuTensor* attention_input = nullptr;
 };
 
 
-// --- Attention Layer Class Definitions ---
+// --- 어텐션 계층 클래스 정의 ---
 
+/**
+ * @class BertSelfAttention
+ * @brief BERT의 핵심인 Multi-Head Self-Attention을 계산하는 클래스.
+ * 입력으로 들어온 hidden_states를 Q, K, V로 투영하고, 어텐션 스코어를 계산하여 Context 벡터를 생성합니다.
+ */
 class BertSelfAttention {
 private:
-    // const BertConfig& config_; // Store if needed for num_heads, head_size etc.
-    DenseLayer query_, key_, value_;
-    Dropout dropout_; // Dropout for attention probabilities
+    DenseLayer query_, key_, value_; // Q, K, V를 생성하기 위한 Dense 레이어
+    Dropout dropout_;                // 어텐션 확률에 적용될 드롭아웃
 
-    int num_attention_heads_;
-    int attention_head_size_;
-    // float scale_factor_; // 1.0f / sqrtf(attention_head_size_)
+    int num_attention_heads_;     // 어텐션 헤드의 수
+    int attention_head_size_;     // 각 헤드의 차원 크기
 
 public:
+    /**
+     * @brief BertSelfAttention 생성자.
+     * @param config BertConfig 객체.
+     * @param name_prefix 파라미터 이름에 사용될 접두사.
+     */
     BertSelfAttention(const BertConfig& config, const std::string& name_prefix);
 
+    /**
+     * @brief 순전파를 수행합니다.
+     * @param hidden_states 입력 텐서 (B, S, H).
+     * @param attention_mask 어텐션 마스크.
+     * @param cache 역전파에 사용될 중간 값들을 저장할 캐시 객체.
+     * @param is_training 학습 모드 여부.
+     */
     void forward(rocblas_handle blas_handle, hipStream_t stream,
-                 const GpuTensor& hidden_states, // Input (B, S, H)
-                 const GpuTensor& attention_mask, // Mask (e.g., B, 1, 1, S)
+                 const GpuTensor& hidden_states,
+                 const GpuTensor& attention_mask,
                  SelfAttentionCache& cache,
                  bool is_training);
 
-    // grad_input is the gradient w.r.t. hidden_states passed to forward
+    /**
+     * @brief 역전파를 수행하여 입력 및 파라미터에 대한 그래디언트를 계산합니다.
+     * @param grad_context_layer_output 상위 계층에서 전달된 context_layer에 대한 그래디언트.
+     * @param cache 순전파 시 저장된 캐시 객체.
+     * @param grad_input_hidden_states 계산된 입력(hidden_states)에 대한 그래디언트 (출력).
+     */
     void backward(rocblas_handle blas_handle, hipStream_t stream,
-                  const GpuTensor& grad_context_layer_output, // Gradient from the layer above
+                  const GpuTensor& grad_context_layer_output,
                   SelfAttentionCache& cache,
                   GpuTensor& grad_input_hidden_states);
 
+    /**
+     * @brief 이 계층에 속한 모든 파라미터의 포인터 리스트를 반환합니다.
+     */
     std::vector<Parameter*> get_parameters();
 };
 
+/**
+ * @class BertAttention
+ * @brief Self-Attention 연산과 그 후의 Output 레이어(Dense, Dropout, Residual, LayerNorm)를 포함하는 전체 어텐션 모듈.
+ */
 class BertAttention {
 private:
-    // const BertConfig& config_;
-    BertSelfAttention self_attention_;
-    DenseLayer output_dense_; // BertSelfOutput dense layer
-    Dropout output_dropout_;
-    LayerNorm output_layernorm_; // LayerNorm after residual connection
+    BertSelfAttention self_attention_;   // Self-Attention 계산 파트
+    DenseLayer output_dense_;          // Self-Attention 출력에 적용되는 Dense 레이어
+    Dropout output_dropout_;           // 드롭아웃
+    LayerNorm output_layernorm_;       // 잔차 연결 후 적용되는 Layer Normalization
 
 public:
     BertAttention(const BertConfig& config, const std::string& name_prefix);
 
-    // Output of this layer is (attention_output + residual) -> LayerNorm
+    /**
+     * @brief BertAttention 모듈 전체의 순전파를 수행합니다.
+     * @param input_tensor 모듈의 입력이자 잔차 연결에 사용될 텐서 (B, S, H).
+     * @param attention_mask 어텐션 마스크.
+     * @param cache 역전파를 위한 캐시 객체.
+     * @param is_training 학습 모드 여부.
+     */
     void forward(rocblas_handle blas_handle, hipStream_t stream,
-                 const GpuTensor& input_tensor, // Input for residual connection (B,S,H)
+                 const GpuTensor& input_tensor,
                  const GpuTensor& attention_mask,
                  BertAttentionCache& cache,
                  bool is_training);
 
-    // grad_input is w.r.t. input_tensor
+    /**
+     * @brief BertAttention 모듈 전체의 역전파를 수행합니다.
+     * @param grad_output_layernorm 상위 계층에서 전달된 최종 출력에 대한 그래디언트.
+     * @param cache 순전파 시 저장된 캐시 객체.
+     * @param grad_input_tensor 계산된 모듈 입력(input_tensor)에 대한 그래디언트 (출력).
+     */
     void backward(rocblas_handle blas_handle, hipStream_t stream,
-                  const GpuTensor& grad_output_layernorm, // Gradient from the layer above
+                  const GpuTensor& grad_output_layernorm,
                   BertAttentionCache& cache,
                   GpuTensor& grad_input_tensor);
 
+    /**
+     * @brief 이 모듈 및 하위 모듈의 모든 파라미터 포인터 리스트를 반환합니다.
+     */
     std::vector<Parameter*> get_parameters();
 };
-
 
 #endif // ATTENTION_HIP_HPP
