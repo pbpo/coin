@@ -137,5 +137,16 @@ void launch_softmax_backward_kernel( // Added based on usage in BertSelfAttentio
 void launch_elementwise_add_kernel(hipStream_t stream, float* out, const float* in1, const float* in2, size_t num_elements);
 void launch_accumulate_kernel(hipStream_t stream, float* target_and_out, const float* to_add, size_t num_elements);
 
+// Backward kernel for add_bias_gelu operation
+void launch_gelu_add_bias_backward_kernel(
+    hipStream_t stream,
+    float* grad_input_before_bias, // Output: Gradient w.r.t. input that bias was added to
+    float* grad_bias,              // Output: Gradient w.r.t. bias (accumulated)
+    const float* grad_output_after_gelu, // Input: Gradient from the layer above (after GELU)
+    const float* input_before_gelu,      // Input: The tensor that was fed into GELU (input + bias)
+    int M, // Number of rows (e.g., batch_size * seq_len)
+    int N  // Number of columns (e.g., hidden_size or intermediate_size)
+);
+
 
 #endif // HIP_KERNELS_HPP

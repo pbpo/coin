@@ -4,7 +4,8 @@
 #include <stdexcept>       // For runtime_error
 #include <vector>
 #include <string>
-#include <cstdlib> // For std::rand for dropout seed
+#include <cstdlib> // For std::rand for dropout seed (now replaced)
+#include <random>  // For std::random_device, std::mt19937_64
 
 // --- Dropout Implementation ---
 Dropout::Dropout(float prob) : dropout_prob_(prob) {
@@ -20,8 +21,11 @@ void Dropout::forward(hipStream_t stream, GpuTensor& input_output, DropoutCache&
             throw std::runtime_error("Input tensor for Dropout::forward is not allocated.");
         }
         cache.mask.allocate(input_output.dims_);
-        // Using a simple seed generation. For more robust results, a better RNG seeding strategy might be needed.
-        unsigned long long seed = static_cast<unsigned long long>(std::rand());
+
+        // Use std::random_device and std::mt19937 for better seed generation
+        static std::random_device rd; // Static to be initialized once
+        static std::mt19937_64 gen(rd()); // Static to be seeded once
+        unsigned long long seed = gen();
 
         launch_dropout_forward(stream,
                                (float*)input_output.d_ptr_, // Output is in-place modification of input
@@ -132,32 +136,57 @@ void DenseLayer::forward(rocblas_handle blas_handle, hipStream_t stream,
                                 &beta,
                                 (float*)output.d_ptr_, N));   // C, ldc
 
-    // The original DenseLayer::forward in user code also calls launch_add_bias_gelu.
-    // This means this DenseLayer is actually Dense+Bias+GELU.
-    // If only bias, a separate kernel. If bias+gelu, a fused kernel.
+    // `output` tensor initially holds the result of GEMM: input * W^T.
+    // We need to save the state *before* GELU for the backward pass.
+    // `cache.output_before_gelu` will store `(input * W^T) + bias`.
+    // The final `output` tensor will store `GELU((input * W^T) + bias)`.
+
+    cache.output_before_gelu.allocate(output.dims_); // Allocate space in cache
+
     if (params.has_bias_) {
-        // Assuming output from GEMM is the input to add_bias_gelu
-        // M for add_bias_gelu is batch_size_combined, N is out_features
-        // The bias vector is of size out_features.
-        // The launch_add_bias_gelu_kernel expects bias[col]
-        launch_add_bias_gelu_kernel(stream,
-                                   (float*)output.d_ptr_,          // Output (in-place)
-                                   (const float*)output.d_ptr_,    // Input (result from GEMM)
-                                   (const float*)params.bias.d_ptr_,
-                                   M, N);                          // M=batch_combined, N=out_features
+        // Calculate `(input * W^T) + bias` and store it in `cache.output_before_gelu`.
+        // `output` currently holds `input * W^T`.
+        launch_add_bias_kernel(stream,
+                               (float*)cache.output_before_gelu.d_ptr(), // Output: gemm_out + bias
+                               (const float*)output.d_ptr(),             // Input: gemm_out
+                               (const float*)params.bias.d_ptr_,
+                               M, N);
+    } else {
+        // If no bias, `output_before_gelu` is just the GEMM output.
+        cache.output_before_gelu.copy_from_gpu(output, stream);
     }
 
-    cache.input = &input; // Store for backward pass
+    // Now, `cache.output_before_gelu` holds the value that will be fed into GELU.
+    // Apply GELU to `cache.output_before_gelu` and store the result in the final `output` tensor.
+    // This requires a GELU-only kernel. We can use `launch_add_bias_gelu_kernel` with a zero bias.
+    GpuTensor dummy_zero_bias; // Create a dummy zero bias tensor for the GELU call.
+    if (N > 0) {
+      dummy_zero_bias.allocate({N});
+      dummy_zero_bias.zero_out(stream);
+      HIP_CHECK(hipStreamSynchronize(stream)); // Ensure zero_out completes before use
+    }
+
+    launch_add_bias_gelu_kernel(stream,
+                               (float*)output.d_ptr(), // Final output
+                               (const float*)cache.output_before_gelu.d_ptr(), // Input to GELU
+                               (const float*)(N > 0 ? dummy_zero_bias.d_ptr_ : nullptr), // Zero bias, handle N=0 case
+                               M, N);
+
+    cache.input_to_gemm = &input; // Store original input to GEMM for backward pass
 }
 
 void DenseLayer::backward(rocblas_handle blas_handle, hipStream_t stream,
-                          const GpuTensor& grad_output, const DenseLayerCache& cache,
-                          GpuTensor& grad_input) {
-    // grad_output shape: (batch_dims..., out_features)
-    // input shape (from cache): (batch_dims..., in_features)
+                          const GpuTensor& grad_output_after_gelu, const DenseLayerCache& cache,
+                          GpuTensor& grad_input_gemm) { // Renamed grad_input to grad_input_gemm for clarity
+    // grad_output_after_gelu shape: (batch_dims..., out_features)
+    // input_to_gemm shape (from cache): (batch_dims..., in_features)
     // weights shape: (out_features, in_features)
+    // output_before_gelu shape (from cache): (batch_dims..., out_features)
 
-    if (!grad_output.is_allocated() || !cache.input || !cache.input->is_allocated() || !params.weights.is_allocated()) {
+    if (!grad_output_after_gelu.is_allocated() ||
+        !cache.input_to_gemm || !cache.input_to_gemm->is_allocated() ||
+        !cache.output_before_gelu.is_allocated() ||
+        !params.weights.is_allocated()) {
         throw std::runtime_error("Required tensors not allocated for DenseLayer::backward for layer " + name_);
     }
 
@@ -187,50 +216,73 @@ void DenseLayer::backward(rocblas_handle blas_handle, hipStream_t stream,
     int N_grad_out = out_features;                         // N for grad_output (out_features)
     int K_input_feat = in_features;                        // K for input (in_features)
 
+    // The input grad_output_after_gelu is dL/d(GELU_Output).
+    // We need dL/d(LinearOutput) to proceed with GEMM backward.
+    // LinearOutput = GEMM_Result + Bias (this is stored in cache.output_before_gelu)
+
+    GpuTensor grad_linear_output; // Gradient w.r.t. (GEMM_Result + Bias)
+    grad_linear_output.allocate(grad_output_after_gelu.dims_);
+
+    // Step 1: Backward through GELU and Bias addition.
+    // This kernel calculates grad_linear_output (dL/d(InputToGelu)) and params.grad_bias.
+    // Note: params.grad_bias must be zeroed out by optimizer before each accumulation step if accumulating over mini-batches.
+    // The kernel launch_gelu_add_bias_backward_kernel uses atomicAdd for grad_bias, so it accumulates within a call.
+    if (params.has_bias_) {
+        launch_gelu_add_bias_backward_kernel(stream,
+                                       (float*)grad_linear_output.d_ptr_,
+                                       (float*)params.grad_bias.d_ptr_,
+                                       (const float*)grad_output_after_gelu.d_ptr(),
+                                       (const float*)cache.output_before_gelu.d_ptr(), // This was (GEMM_out + Bias)
+                                       M_grad_out, N_grad_out);
+    } else {
+        // If no bias, GELU was applied directly to GEMM output.
+        // We need a GELU backward kernel here. `launch_gelu_backward_kernel` is available.
+        // grad_bias calculation is skipped.
+        launch_gelu_backward_kernel(stream,
+                                    (float*)grad_linear_output.d_ptr(),
+                                    (const float*)grad_output_after_gelu.d_ptr(),
+                                    (const float*)cache.output_before_gelu.d_ptr(), // This was GEMM_out
+                                    grad_linear_output.num_elements_);
+        // params.grad_bias remains zero or untouched if not allocated.
+    }
+
 
     ROCBLAS_CHECK(rocblas_set_stream(blas_handle, stream));
     const float alpha = 1.0f, beta_one = 1.0f; // Use beta_one for accumulating gradients
 
-    // 1. Calculate grad_input = grad_output * weights
-    //    grad_input (M_grad_out, K_input_feat) = grad_output (M_grad_out, N_grad_out) * weights (N_grad_out, K_input_feat)
-    //    A = grad_output (M, N_out), B = weights (N_out, K_in) -> C = grad_input (M, K_in)
-    //    lda = N_out, ldb = K_in, ldc = K_in
+    // Step 2: Calculate grad_input_gemm = grad_linear_output * weights
+    // grad_input_gemm (M_grad_out, K_input_feat) = grad_linear_output (M_grad_out, N_grad_out) * weights (N_grad_out, K_input_feat)
     ROCBLAS_CHECK(rocblas_sgemm(blas_handle,
                                 rocblas_operation_none,       // opA
-                                rocblas_operation_none,       // opB
+                                rocblas_operation_none,       // opB (weights are N_out x K_in)
                                 M_grad_out, K_input_feat, N_grad_out,
                                 &alpha,
-                                (const float*)grad_output.d_ptr_, N_grad_out,      // A, lda
+                                (const float*)grad_linear_output.d_ptr_, N_grad_out,      // A, lda
                                 (const float*)params.weights.d_ptr_, K_input_feat, // B, ldb
-                                &beta_one, // Accumulate if grad_input is not zeroed, otherwise beta_zero
-                                (float*)grad_input.d_ptr_, K_input_feat));     // C, ldc
+                                &beta_one, // Accumulate to existing grad_input_gemm (e.g. from other paths in a complex model)
+                                           // For a simple Dense layer, if grad_input_gemm is not pre-zeroed, this should be beta_zero.
+                                           // Assuming grad_input_gemm is zeroed by caller or this is the only contribution.
+                                           // Let's assume beta_one for accumulation, implying grad_input_gemm might be used by multiple paths.
+                                (float*)grad_input_gemm.d_ptr_, K_input_feat));     // C, ldc
 
 
-    // 2. Calculate grad_weights = input^T * grad_output (누적)
-    //    grad_weights (K_input_feat, N_grad_out) = input^T (K_input_feat, M_grad_out) * grad_output (M_grad_out, N_grad_out)
-    //    A = input (M, K_in), B = grad_output (M, N_out) -> C = grad_weights (K_in, N_out)
-    //    opA = rocblas_operation_transpose
-    //    lda_A_orig = K_in, ldb = N_out, ldc = N_out
+    // Step 3: Calculate grad_weights = input_to_gemm^T * grad_linear_output (누적)
+    // grad_weights (K_input_feat, N_grad_out) = input_to_gemm^T (K_input_feat, M_grad_out) * grad_linear_output (M_grad_out, N_grad_out)
     ROCBLAS_CHECK(rocblas_sgemm(blas_handle,
-                                rocblas_operation_transpose,  // opA (input is M,K -> use as K,M)
+                                rocblas_operation_transpose,  // opA (input_to_gemm is M,K -> use as K,M)
                                 rocblas_operation_none,       // opB
                                 K_input_feat, N_grad_out, M_grad_out,
                                 &alpha,
-                                (const float*)cache.input->d_ptr_, K_input_feat, // A (original M,K), lda
-                                (const float*)grad_output.d_ptr_, N_grad_out,   // B (M,N), ldb
+                                (const float*)cache.input_to_gemm->d_ptr_, K_input_feat, // A (original M,K), lda
+                                (const float*)grad_linear_output.d_ptr_, N_grad_out,   // B (M,N), ldb
                                 &beta_one, // Accumulate gradients
                                 (float*)params.grad_weights.d_ptr_, N_grad_out)); // C (K,N), ldc
 
-    // 3. Calculate grad_bias = sum(grad_output, axis=0) (누적)
-    if (params.has_bias_) {
-        // grad_output is (M_grad_out, N_grad_out) = (batch_combined, out_features)
-        // grad_bias is (out_features)
-        // We need to sum grad_output along the batch_combined dimension (axis 0).
-        launch_reduce_sum_axis0_add_kernel(stream,
-                                   (float*)params.grad_bias.d_ptr(),
-                                   (const float*)grad_output.d_ptr(),
-                                   M_grad_out, N_grad_out); // M=rows_to_reduce (batch_combined), N=cols_to_keep (out_features)
-    }
+    // grad_bias is already calculated by launch_gelu_add_bias_backward_kernel if bias was present.
+    // If there was no bias, params.grad_bias should not be touched or should be zero.
+    // The original code's grad_bias calculation was:
+    // launch_reduce_sum_axis0_add_kernel(stream, (float*)params.grad_bias.d_ptr(), (const float*)grad_output.d_ptr(), M_grad_out, N_grad_out);
+    // This is now handled by the fused backward kernel for add_bias_gelu.
 }
 
 

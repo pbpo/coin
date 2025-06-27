@@ -9,8 +9,9 @@
 
 // --- Cache Structs for NN Layers ---
 struct DenseLayerCache {
-    const GpuTensor* input = nullptr;
-    // Other intermediate tensors if needed by specific dense layer variants
+    const GpuTensor* input_to_gemm = nullptr; // Original input to the GEMM operation
+    GpuTensor output_before_gelu; // Output of GEMM + Bias, input to GELU. Owned by cache.
+    // Other intermediate tensors if needed
 };
 
 struct LayerNormCache {

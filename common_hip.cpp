@@ -57,21 +57,21 @@ void GpuTensor::allocate(const std::vector<int>& new_dims) {
 
     element_size_ = (dtype == DataType::INT32) ? sizeof(int) : sizeof(float);
     size_t new_size_bytes = new_num_elements * element_size_;
+    size_t current_size_bytes = allocated_ ? num_elements_ * element_size_ : 0;
 
-    if (!allocated_ || new_num_elements != num_elements_ || d_ptr_ == nullptr) { // Added d_ptr_ == nullptr check
-        free(); // Ensure previously allocated memory is freed
-        num_elements_ = new_num_elements;
-        HIP_CHECK(hipMalloc(&d_ptr_, new_size_bytes));
-        allocated_ = true;
-    } else if (new_size_bytes > num_elements_ * element_size_) { // Reallocate if new size is larger
-        free();
-        num_elements_ = new_num_elements;
-        HIP_CHECK(hipMalloc(&d_ptr_, new_size_bytes));
-        allocated_ = true;
-    }
-    // If new_num_elements is the same or smaller and memory is already allocated,
-    // we can reuse it, but update num_elements_ if it's smaller.
-    if (new_num_elements < num_elements_) {
+    if (new_size_bytes != current_size_bytes || d_ptr_ == nullptr) {
+        free(); // Free existing memory if size changes or pointer is null
+        if (new_num_elements > 0) { // Only allocate if new size is non-zero
+            num_elements_ = new_num_elements;
+            HIP_CHECK(hipMalloc(&d_ptr_, new_size_bytes));
+            allocated_ = true;
+        } else {
+            // If new_num_elements is 0, num_elements_ is already set to 0 by free()
+            // and d_ptr_ is nullptr, allocated_ is false.
+        }
+    } else {
+        // If size is the same and memory is already allocated, just update num_elements_
+        // This case primarily handles calls to allocate with the same dimensions again.
         num_elements_ = new_num_elements;
     }
 }

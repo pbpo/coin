@@ -248,6 +248,65 @@ __global__ void layer_norm_backward_kernel_optimized_impl(
     }
 }
 
+// --- GELU Add Bias Backward Kernel ---
+__global__ void gelu_add_bias_backward_kernel_impl(
+    float* grad_input_before_bias, // Output: Gradient w.r.t. input that bias was added to
+    float* grad_bias,              // Output: Gradient w.r.t. bias (will be summed up here)
+    const float* grad_output_after_gelu, // Input: Gradient from the layer above (after GELU)
+    const float* input_before_gelu,      // Input: The tensor that was fed into GELU (original_input + bias)
+    int M, // Number of rows (e.g., batch_size * seq_len)
+    int N  // Number of columns (e.g., hidden_size or intermediate_size)
+) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y; // M dimension
+    int col = blockIdx.x * blockDim.x + threadIdx.x; // N dimension
+
+    if (row < M && col < N) {
+        int idx = row * N + col;
+
+        // Step 1: Calculate dL/d(input_before_gelu) = dL/d(output_after_gelu) * dGELU/d(input_before_gelu)
+        float dL_dInputBeforeGelu = grad_output_after_gelu[idx] * gelu_grad_fn_device(input_before_gelu[idx]);
+
+        // Step 2: This dL_dInputBeforeGelu is also dL/d(original_input + bias).
+        // So, dL/d(original_input) = dL_dInputBeforeGelu
+        // And dL/d(bias_col) = sum_rows(dL_dInputBeforeGelu_row_col)
+
+        grad_input_before_bias[idx] = dL_dInputBeforeGelu;
+
+        // Accumulate gradient for bias. Each thread in a block handles one column for many rows.
+        // This requires reduction over rows for each column for grad_bias.
+        // The current launch parameters for add_bias_gelu were grid((N+tx-1)/tx, (M+ty-1)/ty), threads(16,16).
+        // This implies each thread calculates one element.
+        // For grad_bias, we need to sum dL_dInputBeforeGelu over 'row' for each 'col'.
+        // This is similar to reduce_sum_axis0_add_kernel_impl.
+        // A simpler way if this kernel is launched per element: atomicAdd for grad_bias.
+        atomicAdd(&grad_bias[col], dL_dInputBeforeGelu);
+    }
+}
+
+void launch_gelu_add_bias_backward_kernel(
+    hipStream_t stream,
+    float* grad_input_before_bias,
+    float* grad_bias,
+    const float* grad_output_after_gelu,
+    const float* input_before_gelu,
+    int M,
+    int N) {
+    if (M == 0 || N == 0) return;
+
+    // IMPORTANT: grad_bias should be zeroed out before this kernel if it's an accumulation over multiple batches.
+    // Here, atomicAdd handles accumulation within a single call for different rows.
+    // If called multiple times (e.g. different data in a loop), zeroing grad_bias outside is crucial.
+
+    dim3 threads(16, 16); // Matches the forward kernel's launch config style
+    dim3 grid((N + threads.x - 1) / threads.x, (M + threads.y - 1) / threads.y);
+
+    hipLaunchKernelGGL(gelu_add_bias_backward_kernel_impl, grid, threads, 0, stream,
+                       grad_input_before_bias, grad_bias,
+                       grad_output_after_gelu, input_before_gelu,
+                       M, N);
+    HIP_CHECK(hipGetLastError());
+}
+
 
 // --- GELU Kernels ---
 __device__ float gelu_fn_device(float x) { // Renamed to avoid conflict
@@ -786,10 +845,37 @@ void launch_setup_batched_gemm_pointers(
     if (batch_count == 0) return;
 
     // Strides are per matrix within the batch
-    size_t stride_A = (A_tensor.num_elements_ > 0 && batch_count > 0) ? A_tensor.num_elements_ / batch_count : 0;
-    size_t stride_B = (B_tensor.num_elements_ > 0 && batch_count > 0) ? B_tensor.num_elements_ / batch_count : 0;
-    size_t stride_C = (C_tensor.num_elements_ > 0 && batch_count > 0) ? C_tensor.num_elements_ / batch_count : 0;
+    size_t stride_A = 0, stride_B = 0, stride_C = 0;
 
+    if (batch_count > 0) {
+        if (A_tensor.num_elements_ > 0) {
+            if (A_tensor.num_elements_ % batch_count != 0) {
+                // Consider throwing an error or logging a warning
+                // For now, proceed with integer division, but this indicates a potential issue with input shapes/batching
+            }
+            stride_A = A_tensor.num_elements_ / batch_count;
+        }
+        if (B_tensor.num_elements_ > 0) {
+            if (B_tensor.num_elements_ % batch_count != 0) {
+                // Warning or error
+            }
+            stride_B = B_tensor.num_elements_ / batch_count;
+        }
+        if (C_tensor.num_elements_ > 0) {
+            if (C_tensor.num_elements_ % batch_count != 0) {
+                // Warning or error
+            }
+            stride_C = C_tensor.num_elements_ / batch_count;
+        }
+    } else { // batch_count is 0, kernel will do nothing due to its own checks.
+        return; // Or handle as an error if batch_count must be > 0
+    }
+
+    // If any stride calculation results in 0 for a tensor that is supposed to be processed,
+    // it might indicate an issue, e.g. num_elements < batch_count.
+    // The kernel setup_batched_gemm_pointers_kernel itself is safe due to `idx < batch_count`.
+    // If stride is 0, all pointers in A_array (or B, C) will point to A_base (or B, C base).
+    // This might be intended for some specific broadcast-like scenario, but usually not for batched GEMM.
 
     dim3 block_dim(THREADS_PER_BLOCK_DEFAULT);
     dim3 grid_dim((batch_count + block_dim.x - 1) / block_dim.x);
@@ -1162,29 +1248,35 @@ void launch_softmax_backward_kernel(
 }
 
 
-// Placeholder implementations for add/accumulate kernels
-// These should have proper implementations.
+// --- Element-wise Add/Accumulate Kernels ---
+__global__ void elementwise_add_kernel_impl(float* out, const float* in1, const float* in2, size_t n) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        out[idx] = in1[idx] + in2[idx];
+    }
+}
+
+__global__ void accumulate_kernel_impl(float* target_and_out, const float* to_add, size_t n) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        target_and_out[idx] += to_add[idx];
+    }
+}
+
 void launch_elementwise_add_kernel(hipStream_t stream, float* out, const float* in1, const float* in2, size_t num_elements) {
     if (num_elements == 0) return;
-    // This requires a kernel like:
-    // __global__ void elementwise_add_impl(float* o, const float* a, const float* b, size_t n) {
-    //    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    //    if(idx < n) o[idx] = a[idx] + b[idx];
-    // }
-    // For now, as a placeholder to avoid breaking compilation, copy in1 to out. THIS IS WRONG.
-    // HIP_CHECK(hipMemcpyAsync(out, in1, num_elements * sizeof(float), hipMemcpyDeviceToDevice, stream));
-    // Or throw error:
-    // throw std::runtime_error("launch_elementwise_add_kernel is not implemented.");
-    // To make it "run" without error (but wrong logic):
-    if (out != in1) HIP_CHECK(hipMemcpyAsync(out, in1, num_elements * sizeof(float), hipMemcpyDeviceToDevice, stream));
-    // Then if out == in1, it would need to actually add in2. This placeholder is insufficient.
+    dim3 block_dim(THREADS_PER_BLOCK_DEFAULT);
+    dim3 grid_dim((num_elements + block_dim.x - 1) / block_dim.x);
+    hipLaunchKernelGGL(elementwise_add_kernel_impl, grid_dim, block_dim, 0, stream, out, in1, in2, num_elements);
+    HIP_CHECK(hipGetLastError());
 }
 
 void launch_accumulate_kernel(hipStream_t stream, float* target_and_out, const float* to_add, size_t num_elements) {
     if (num_elements == 0) return;
-    // Requires kernel: target[i] += to_add[i]
-    // throw std::runtime_error("launch_accumulate_kernel is not implemented.");
-    // Placeholder: no-op. THIS IS WRONG.
+    dim3 block_dim(THREADS_PER_BLOCK_DEFAULT);
+    dim3 grid_dim((num_elements + block_dim.x - 1) / block_dim.x);
+    hipLaunchKernelGGL(accumulate_kernel_impl, grid_dim, block_dim, 0, stream, target_and_out, to_add, num_elements);
+    HIP_CHECK(hipGetLastError());
 }
 
 

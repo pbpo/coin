@@ -228,25 +228,11 @@ void BertLayer::forward(rocblas_handle blas_handle, hipStream_t stream,
     // This is a current gap. For now, assume `cache.attention_cache.output_layernorm_cache.input` (if LN is inplace) or a dedicated output field in BertAttentionCache is used.
     // Let's assume BertAttention's forward method will fill `cache.ffn_input_after_attention` correctly.
     // This implies BertAttention::forward should have `GpuTensor& attention_block_output` argument.
-    // The current attention_hip.cpp's BertAttention::forward is simplified and doesn't clearly output.
-    // Let's assume `cache.attention_cache.output_layernorm_cache.input` (if layernorm was in-place on its output)
-    // or a specific output tensor from BertAttention is copied to `cache.ffn_input_after_attention`.
-    // This part is simplified due to missing explicit output from BertAttention::forward in attention_hip.cpp.
-    // For now, I'll use a placeholder copy, this needs to be fixed by BertAttention::forward.
-    // A simple fix: BertAttention::forward should take an output tensor.
-    // For the purpose of this file, I'll assume it does and writes to cache.ffn_input_after_attention.
-    // This means the `attention_.forward` call needs to be:
-    // attention_.forward(blas_handle, stream, input_hidden_states, attention_mask, cache.ffn_input_after_attention, cache.attention_cache, is_training);
-    // This changes BertAttention::forward signature. For now, I cannot make that change from here.
-    // So, this step is currently incomplete due to BertAttention's forward signature.
-    // Let's assume `cache.ffn_input_after_attention` is correctly populated by `attention_.forward`.
-    // The original user code for `BertLayer` was:
-    // x = self.attention(hidden_states, attention_mask)
-    // ... then FFN on x ...
-    // So, `cache.ffn_input_after_attention` must hold the output of the attention block.
-    // The `attention_.forward` in `attention_hip.cpp` writes its final LayerNorm output to `dense_output` (which is a local var).
-    // This needs to be fixed: `BertAttention::forward` must take `GpuTensor& attention_module_output`.
-    // For now, this is a known issue. I will proceed assuming `cache.ffn_input_after_attention` is somehow correctly filled.
+    // Based on previous changes, BertAttention::forward now writes its output to
+    // cache.self_attention_cache.context_layer (repurposed field).
+    // So, we copy from there to BertLayerCache's ffn_input_after_attention.
+    attention_.forward(blas_handle, stream, input_hidden_states, attention_mask, cache.attention_cache, is_training);
+    cache.ffn_input_after_attention.copy_from_gpu(cache.attention_cache.self_attention_cache.context_layer, stream);
 
 
     // 2. FFN (Feed-Forward Network)
@@ -271,16 +257,17 @@ void BertLayer::forward(rocblas_handle blas_handle, hipStream_t stream,
     ffn_output_dropout_.forward(stream, ffn_output_dense_result, cache.ffn_output_dropout_cache, is_training);
 
     // Residual connection for FFN: ffn_output_dense_result (after dropout) + ffn_input_after_attention
-    // Again, needs an element-wise add kernel.
-    // launch_elementwise_add_kernel(stream, (float*)ffn_output_dense_result.d_ptr(),
-    //                              (const float*)ffn_output_dense_result.d_ptr(),
-    //                              (const float*)cache.ffn_input_after_attention.d_ptr(),
-    //                              ffn_output_dense_result.num_elements_);
-    // This is a MISSING PIECE. For now, ffn_output_dense_result is passed to LayerNorm without sum.
+    GpuTensor ffn_residual_sum_output;
+    ffn_residual_sum_output.allocate(ffn_output_dense_result.dims_);
+    launch_elementwise_add_kernel(stream,
+                                 (float*)ffn_residual_sum_output.d_ptr(),
+                                 (const float*)ffn_output_dense_result.d_ptr(), // Output of FFN (after dropout)
+                                 (const float*)cache.ffn_input_after_attention.d_ptr(), // Output of Attention block
+                                 ffn_residual_sum_output.num_elements_);
 
     // Final LayerNorm for FFN block
     // The output of this LayerNorm is the final output of BertLayer.
-    ffn_output_layernorm_.forward(stream, ffn_output_dense_result, output_hidden_states, cache.ffn_output_layernorm_cache);
+    ffn_output_layernorm_.forward(stream, ffn_residual_sum_output, output_hidden_states, cache.ffn_output_layernorm_cache);
 }
 
 void BertLayer::backward(rocblas_handle blas_handle, hipStream_t stream,
@@ -350,10 +337,12 @@ void BertLayer::backward(rocblas_handle blas_handle, hipStream_t stream,
     // After this, grad_ffn_input contains dL/d(attention_out) from the main FFN path.
 
     // Accumulate gradients for attention_block_output:
-    // grad_attention_block_output already has dL/d(attention_out)_from_ffn_residual.
-    // We need to add dL/d(attention_out)_from_ffn_main_path (which is grad_ffn_input).
-    // launch_accumulate_kernel(stream, (float*)grad_attention_block_output.d_ptr(), (const float*)grad_ffn_input.d_ptr(), grad_attention_block_output.num_elements_);
-    // This accumulation is MISSING. For now, grad_attention_block_output will only have one path.
+    // grad_attention_block_output already has dL/d(attention_out) from the FFN's residual path.
+    // We need to add dL/d(attention_out) from the FFN's main computation path (which is grad_ffn_input).
+    launch_accumulate_kernel(stream,
+                             (float*)grad_attention_block_output.d_ptr(),
+                             (const float*)grad_ffn_input.d_ptr(), // grad_ffn_input is dL/d(output of attention block) via FFN main path
+                             grad_attention_block_output.num_elements_);
 
     // Now, grad_attention_block_output is the true gradient for the output of the BertAttention module.
     // Pass this to BertAttention's backward method.
