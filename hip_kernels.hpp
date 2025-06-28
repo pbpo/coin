@@ -64,6 +64,9 @@ void launch_add_bias_gelu_kernel( // Keep distinct name from the other add_bias_
 void launch_gelu_backward_kernel( // Keep distinct name
     hipStream_t stream, float* grad_input, const float* grad_output, const float* input, size_t num_elements);
 
+void launch_gelu_forward_kernel(
+    hipStream_t stream, float* output, const float* input, size_t num_elements);
+
 // Reduction Kernels
 void launch_reduce_sum_axis0_add_kernel( // Keep distinct name
     hipStream_t stream, float* out_grad, const float* in_grad, int M, int N);

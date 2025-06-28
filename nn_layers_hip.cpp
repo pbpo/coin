@@ -193,11 +193,11 @@ void DenseLayer::backward(rocblas_handle blas_handle, hipStream_t stream,
     int out_features = params.weights.dim_size(0);
     int in_features = params.weights.dim_size(1);
 
-    if (grad_output.dims_.back() != out_features) {
+    if (grad_output_after_gelu.dims_.back() != out_features) {
         throw std::runtime_error("grad_output feature size mismatch for DenseLayer " + name_);
     }
-    if (!grad_input.is_allocated() || grad_input.dims_ != cache.input->dims_) {
-        grad_input.allocate(cache.input->dims_);
+    if (!grad_input_gemm.is_allocated() || !cache.input_to_gemm || grad_input_gemm.dims_ != cache.input_to_gemm->dims_) {
+        grad_input_gemm.allocate(cache.input_to_gemm->dims_);
     }
     if (!params.grad_weights.is_allocated() || params.grad_weights.dims_ != params.weights.dims_) {
         params.grad_weights.allocate(params.weights.dims_);
@@ -208,8 +208,8 @@ void DenseLayer::backward(rocblas_handle blas_handle, hipStream_t stream,
 
 
     size_t batch_size_combined = 1;
-    for (size_t i = 0; i < grad_output.dims_.size() - 1; ++i) {
-        batch_size_combined *= grad_output.dim_size(i);
+    for (size_t i = 0; i < grad_output_after_gelu.dims_.size() - 1; ++i) {
+        batch_size_combined *= grad_output_after_gelu.dim_size(i);
     }
 
     int M_grad_out = static_cast<int>(batch_size_combined); // M for grad_output (batch_combined)
@@ -374,64 +374,11 @@ void Gelu::forward(hipStream_t stream, const GpuTensor& input, GpuTensor& output
         output.allocate(input.dims_);
     }
     cache.input = &input;
-
-    // Note: The original code's DenseLayer fused GELU.
-    // If GELU is used standalone, it needs its own kernel call.
-    // The add_bias_gelu_kernel also performs bias. If input is already biased, just need GELU part.
-    // For a pure GELU forward, we'd need a kernel like `gelu_forward_kernel(output, input, num_elements)`
-    // The provided `add_bias_gelu_kernel` can be used if we pass a zero bias tensor.
-    // Or, a more direct approach: if this Gelu class is used, it should call a dedicated GELU kernel.
-    // For now, let's assume the call to `launch_add_bias_gelu_kernel` with a zero bias if no bias is intended.
-    // However, the `launch_add_bias_gelu_kernel` expects M, N.
-    // A simpler `gelu_kernel(output, input, num_elements)` would be better.
-    // The file has `gelu_backward_kernel_impl` but no standalone `gelu_forward_kernel_impl`.
-    // It has `add_bias_gelu_kernel_impl`.
-    // This Gelu class's forward is tricky without a dedicated kernel.
-    // Let's assume the user's intent was that GELU is usually fused,
-    // and if standalone, it might be part of a custom sequence.
-    // For this implementation, copying input to output if no dedicated kernel.
-    // This is NOT a GELU computation. A proper GELU kernel is needed.
-    // *** This is a placeholder - a real GELU kernel call is needed here ***
-    // For example, if we had `launch_gelu_forward_kernel(stream, (float*)output.d_ptr_, (const float*)input.d_ptr_, input.num_elements_);`
-    // Since it's missing, and DenseLayer handles its own GELU, this standalone GELU's forward is problematic.
-    // For now, let's make it an error or a pass-through, as no pure GELU forward kernel was in the original code dump.
-    // throw std::runtime_error("Standalone Gelu::forward requires a dedicated gelu_forward_kernel, which is not available in the provided kernels. It's usually fused.");
-    // Update: The `add_bias_gelu_kernel_impl` can do this if bias is nullptr or zero.
-    // But it requires M, N. If input is 1D, M=1, N=num_elements.
-    // If input is e.g. (B,S,H), then M=B*S, N=H.
-    if (input.dims_.empty()) throw std::runtime_error("Gelu input has no dimensions.");
-    if (input.num_elements_ == 0) return;
-
-    int M = 1;
-    for(size_t i=0; i < input.dims_.size() -1; ++i) M*= input.dim_size(i);
-    int N = input.dims_.back();
-
-    GpuTensor zero_bias_dummy; // Create a dummy zero bias if needed
-    // This is a workaround. A direct GELU kernel is better.
-    // We are calling add_bias_gelu with a conceptual zero bias.
-    // The kernel `add_bias_gelu_kernel_impl` takes `const float* bias`.
-    // If we don't have a bias, we can't just pass nullptr if the kernel dereferences it.
-    // The most robust way is to have a dedicated `gelu_kernel`.
-    // Given the constraints, let's assume the input to this Gelu is the raw values *before* any activation.
-    // And this function applies GELU.
-    // The kernel `add_bias_gelu_kernel_impl` applies `input[idx] + bias[col]` then GELU.
-    // If we want just GELU(input), we need a kernel that does `gelu(input[idx])`.
-    // The available `gelu_fn_device` can be wrapped in a simple kernel.
-    // For now, the `launch_add_bias_gelu_kernel` is the closest.
-    // We will *not* add a bias here. This implies the `input` is what GELU should be applied to.
-    // This means the `add_bias_gelu_kernel` is being misused or needs a mode.
-    // A simple solution: use `gelu_backward_kernel`'s structure for a forward pass.
-    // Create a temporary simple gelu_forward_kernel for this.
-    // For the scope of this file, I'll assume the `DenseLayer` handles its GELU,
-    // and this standalone Gelu is for other uses, requiring its own kernel not fully provided.
-    // Let's use the structure of gelu_backward_kernel to make a simple forward one for now.
-    // This is an ad-hoc solution based on available device functions.
-    // It would be better to define this kernel in hip_kernels.cpp.
-    // For now, let's assume `output.copy_from_gpu(input, stream);` and then a separate GELU call.
-    // The current `DenseLayer::forward` *includes* GELU. So this standalone `Gelu::forward`
-    // might be for a different pattern.
-    // Let's assume it's an error for now, as it's not clearly defined how it should operate with available kernels.
-     throw std::runtime_error("Standalone Gelu::forward is not fully implemented with a dedicated kernel in this context. It's typically fused in DenseLayer.");
+    launch_gelu_forward_kernel(
+        stream,
+        (float*)output.d_ptr_,
+        (const float*)input.d_ptr_,
+        input.num_elements_);
 }
 
 void Gelu::backward(hipStream_t stream, GpuTensor& grad_input, const GpuTensor& grad_output, const GeluCache& cache) {

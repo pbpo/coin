@@ -354,6 +354,13 @@ __global__ void gelu_backward_kernel_impl(float* grad_input, const float* grad_o
     }
 }
 
+__global__ void gelu_forward_kernel_impl(float* output, const float* input, size_t num_elements) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < num_elements) {
+        output[idx] = gelu_fn_device(input[idx]);
+    }
+}
+
 // --- Reduction Kernels ---
 __global__ void reduce_sum_axis0_add_kernel_impl(float* out_grad, const float* in_grad, int M, int N) {
     extern __shared__ float sdata[]; // Dynamic shared memory
@@ -985,6 +992,16 @@ void launch_gelu_backward_kernel(
     dim3 block_dim(THREADS_PER_BLOCK_DEFAULT);
     dim3 grid_dim((num_elements + block_dim.x - 1) / block_dim.x);
     hipLaunchKernelGGL(gelu_backward_kernel_impl, grid_dim, block_dim, 0, stream, grad_input, grad_output, input, num_elements);
+    HIP_CHECK(hipGetLastError());
+}
+
+void launch_gelu_forward_kernel(
+    hipStream_t stream, float* output, const float* input, size_t num_elements)
+{
+    if (num_elements == 0) return;
+    dim3 block_dim(THREADS_PER_BLOCK_DEFAULT);
+    dim3 grid_dim((num_elements + block_dim.x - 1) / block_dim.x);
+    hipLaunchKernelGGL(gelu_forward_kernel_impl, grid_dim, block_dim, 0, stream, output, input, num_elements);
     HIP_CHECK(hipGetLastError());
 }
 
