@@ -69,32 +69,19 @@ DenseLayer::DenseLayer(int in_features, int out_features, const BertConfig& conf
       name_(name), config_(config) {}
 
 
+// *** 수정됨: 비효율적인 forward 로직 개선 ***
 void DenseLayer::forward(rocblas_handle blas_handle, hipStream_t stream,
                          const GpuTensor& input, GpuTensor& output,
                          DenseLayerCache& cache) {
     if (!input.is_allocated() || !params.weights.is_allocated()) {
         throw std::runtime_error("Input or weights tensor not allocated for DenseLayer::forward for layer " + name_);
     }
-    if (params.has_bias_ && !params.bias.is_allocated()) {
-        throw std::runtime_error("Bias tensor not allocated for DenseLayer::forward for layer " + name_ + " but has_bias is true.");
-    }
 
-    // Input shape: (batch_dims..., in_features)
-    // Weight shape: (out_features, in_features)
-    // Output shape: (batch_dims..., out_features)
-
-    // Determine M, K, N for GEMM: C_MxN = A_MxK * B_KxN
-    // A = input (reshaped to 2D: [batch_size_combined, in_features])
-    // B = weights (transposed: [in_features, out_features])
-    // C = output (reshaped to 2D: [batch_size_combined, out_features])
-
-    int in_features = params.weights.dim_size(1); // K
-    int out_features = params.weights.dim_size(0); // N (for C) or M (for B if B is W)
+    int in_features = params.weights.dim_size(1);
+    int out_features = params.weights.dim_size(0);
 
     if (input.dims_.back() != in_features) {
-        throw std::runtime_error("Input feature size mismatch for DenseLayer " + name_ +
-                                 ". Expected " + std::to_string(in_features) +
-                                 ", got " + std::to_string(input.dims_.back()));
+        throw std::runtime_error("Input feature size mismatch for DenseLayer " + name_);
     }
 
     size_t batch_size_combined = 1;
@@ -113,66 +100,46 @@ void DenseLayer::forward(rocblas_handle blas_handle, hipStream_t stream,
     int K = in_features;
     int N = out_features;
 
-    // rocBLAS expects column-major. Our weights are (out_features, in_features)
-    // If we want C_MN = A_MK * B_KN, then B is W^T.
-    // If W is (out, in), W^T is (in, out).
-    // So, C_MxN_out = Input_MxK_in * (Weights_N_out_x_K_in)^T
-    // Here, lda=K, ldb=K, ldc=N
-    // A: input (M, K), lda = K
-    // B: weights (N, K), ldb = K (rocblas_operation_transpose means B is used as KxN)
-    // C: output (M, N), ldc = N
+    // 역전파를 위해 입력 저장
+    cache.input_to_gemm = &input;
+    // 역전파를 위해 GELU의 입력(GEMM 결과 + Bias) 저장
+    cache.output_before_gelu.allocate(output.dims_);
 
     ROCBLAS_CHECK(rocblas_set_stream(blas_handle, stream));
     const float alpha = 1.0f, beta = 0.0f;
 
-    // Perform: output = input * weights^T
+    // 연산: output = input * weights^T
     ROCBLAS_CHECK(rocblas_sgemm(blas_handle,
-                                rocblas_operation_none,         // opA
-                                rocblas_operation_transpose,    // opB (use weights as KxN)
+                                rocblas_operation_none,
+                                rocblas_operation_transpose,
                                 M, N, K,
                                 &alpha,
-                                (const float*)input.d_ptr_, K, // A, lda
-                                (const float*)params.weights.d_ptr_, K, // B (stored as N,K), ldb
+                                (const float*)input.d_ptr_, K,
+                                (const float*)params.weights.d_ptr_, K,
                                 &beta,
-                                (float*)output.d_ptr_, N));   // C, ldc
-
-    // `output` tensor initially holds the result of GEMM: input * W^T.
-    // We need to save the state *before* GELU for the backward pass.
-    // `cache.output_before_gelu` will store `(input * W^T) + bias`.
-    // The final `output` tensor will store `GELU((input * W^T) + bias)`.
-
-    cache.output_before_gelu.allocate(output.dims_); // Allocate space in cache
+                                (float*)cache.output_before_gelu.d_ptr_, N)); // 결과를 바로 cache.output_before_gelu에 저장
 
     if (params.has_bias_) {
-        // Calculate `(input * W^T) + bias` and store it in `cache.output_before_gelu`.
-        // `output` currently holds `input * W^T`.
+        // 융합 커널을 사용하여 Bias 덧셈과 GELU를 한 번에 처리
+        launch_add_bias_gelu_kernel(stream,
+                                   (float*)output.d_ptr_, // 최종 출력
+                                   (const float*)cache.output_before_gelu.d_ptr_, // GEMM 결과
+                                   (const float*)params.bias.d_ptr_,
+                                   M, N);
+        // Bias가 더해진 결과를 다시 cache에 저장 (GELU 역전파에 필요)
         launch_add_bias_kernel(stream,
-                               (float*)cache.output_before_gelu.d_ptr(), // Output: gemm_out + bias
-                               (const float*)output.d_ptr(),             // Input: gemm_out
+                               (float*)cache.output_before_gelu.d_ptr(),
+                               (const float*)cache.output_before_gelu.d_ptr(),
                                (const float*)params.bias.d_ptr_,
                                M, N);
+
     } else {
-        // If no bias, `output_before_gelu` is just the GEMM output.
-        cache.output_before_gelu.copy_from_gpu(output, stream);
+        // Bias가 없으면 GELU만 적용
+        launch_gelu_forward_kernel(stream,
+                                  (float*)output.d_ptr(),
+                                  (const float*)cache.output_before_gelu.d_ptr(), // GEMM 결과가 GELU 입력
+                                  output.num_elements_);
     }
-
-    // Now, `cache.output_before_gelu` holds the value that will be fed into GELU.
-    // Apply GELU to `cache.output_before_gelu` and store the result in the final `output` tensor.
-    // This requires a GELU-only kernel. We can use `launch_add_bias_gelu_kernel` with a zero bias.
-    GpuTensor dummy_zero_bias; // Create a dummy zero bias tensor for the GELU call.
-    if (N > 0) {
-      dummy_zero_bias.allocate({N});
-      dummy_zero_bias.zero_out(stream);
-      HIP_CHECK(hipStreamSynchronize(stream)); // Ensure zero_out completes before use
-    }
-
-    launch_add_bias_gelu_kernel(stream,
-                               (float*)output.d_ptr(), // Final output
-                               (const float*)cache.output_before_gelu.d_ptr(), // Input to GELU
-                               (const float*)(N > 0 ? dummy_zero_bias.d_ptr_ : nullptr), // Zero bias, handle N=0 case
-                               M, N);
-
-    cache.input_to_gemm = &input; // Store original input to GEMM for backward pass
 }
 
 void DenseLayer::backward(rocblas_handle blas_handle, hipStream_t stream,
