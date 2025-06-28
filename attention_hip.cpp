@@ -1,9 +1,9 @@
 #include "attention_hip.hpp"
 #include "common_hip.hpp"
 #include "hip_kernels.hpp"
-#include "bert_components_hip.hpp" // For BertConfig definition
-#include <cmath>                   // For sqrtf
-#include <stdexcept>                 // For std::runtime_error
+#include "bert_components_hip.hpp"
+#include <cmath>
+#include <stdexcept>
 
 // ============================================================================
 // BertSelfAttention 구현부
@@ -86,10 +86,10 @@ void BertSelfAttention::forward(rocblas_handle blas_handle, hipStream_t stream,
         rocblas_operation_none, rocblas_operation_transpose,
         seq_len, seq_len, attention_head_size_,
         &alpha_gemm,
-        (const float*)cache.q_reshaped.d_ptr(), attention_head_size_, (long long)seq_len * attention_head_size_,
-        (const float*)cache.k_reshaped.d_ptr(), attention_head_size_, (long long)seq_len * attention_head_size_,
+        (const float*)cache.q_reshaped.d_ptr(), (long long)seq_len * attention_head_size_, // lda
+        (const float*)cache.k_reshaped.d_ptr(), (long long)seq_len * attention_head_size_, // ldb
         &beta_gemm,
-        (float*)cache.attention_scores.d_ptr(), seq_len, (long long)seq_len * seq_len,
+        (float*)cache.attention_scores.d_ptr(), (long long)seq_len * seq_len, // ldc
         batch_size * num_attention_heads_));
 
     // --- 4. Score 스케일링 및 마스킹 ---
@@ -115,10 +115,10 @@ void BertSelfAttention::forward(rocblas_handle blas_handle, hipStream_t stream,
         rocblas_operation_none, rocblas_operation_none,
         seq_len, attention_head_size_, seq_len,
         &alpha_gemm,
-        (const float*)cache.attention_probs.d_ptr(), seq_len, (long long)seq_len * seq_len,
-        (const float*)cache.v_reshaped.d_ptr(), attention_head_size_, (long long)seq_len * attention_head_size_,
+        (const float*)cache.attention_probs.d_ptr(), (long long)seq_len * seq_len, // lda
+        (const float*)cache.v_reshaped.d_ptr(), (long long)seq_len * attention_head_size_, // ldb
         &beta_gemm,
-        (float*)cache.context_reshaped.d_ptr(), attention_head_size_, (long long)seq_len * attention_head_size_,
+        (float*)cache.context_reshaped.d_ptr(), (long long)seq_len * attention_head_size_, // ldc
         batch_size * num_attention_heads_));
 
     // --- 8. 최종 Context Layer Reshape: (B, N, S, A) -> (B, S, H) ---
@@ -163,14 +163,37 @@ void BertSelfAttention::backward(rocblas_handle blas_handle, hipStream_t stream,
     grad_v_reshaped.allocate(cache.v_reshaped.dims());
 
     ROCBLAS_CHECK(rocblas_set_stream(blas_handle, stream));
-    ROCBLAS_CHECK(rocblas_sgemm_strided_batched(blas_handle, rocblas_operation_none, rocblas_operation_transpose, seq_len, seq_len, attention_head_size_, &alpha, (const float*)grad_context_reshaped.d_ptr(), attention_head_size_, (long long)seq_len * attention_head_size_, (const float*)cache.v_reshaped.d_ptr(), attention_head_size_, (long long)seq_len * attention_head_size_, &beta_zero, (float*)grad_attention_probs.d_ptr(), seq_len, (long long)seq_len * seq_len, batch_size * num_attention_heads_));
-    ROCBLAS_CHECK(rocblas_sgemm_strided_batched(blas_handle, rocblas_operation_transpose, rocblas_operation_none, seq_len, attention_head_size_, seq_len, &alpha, (const float*)cache.attention_probs.d_ptr(), seq_len, (long long)seq_len * seq_len, (const float*)grad_context_reshaped.d_ptr(), attention_head_size_, (long long)seq_len * attention_head_size_, &beta_zero, (float*)grad_v_reshaped.d_ptr(), attention_head_size_, (long long)seq_len * attention_head_size_, batch_size * num_attention_heads_));
+    ROCBLAS_CHECK(rocblas_sgemm_strided_batched(blas_handle, rocblas_operation_none, rocblas_operation_transpose, 
+        seq_len, seq_len, attention_head_size_, 
+        &alpha, 
+        (const float*)grad_context_reshaped.d_ptr(), (long long)seq_len * attention_head_size_,
+        (const float*)cache.v_reshaped.d_ptr(), (long long)seq_len * attention_head_size_, 
+        &beta_zero, 
+        (float*)grad_attention_probs.d_ptr(), (long long)seq_len * seq_len,
+        batch_size * num_attention_heads_));
+        
+    ROCBLAS_CHECK(rocblas_sgemm_strided_batched(blas_handle, rocblas_operation_transpose, rocblas_operation_none, 
+        seq_len, attention_head_size_, seq_len, 
+        &alpha, 
+        (const float*)cache.attention_probs.d_ptr(), (long long)seq_len * seq_len,
+        (const float*)grad_context_reshaped.d_ptr(), (long long)seq_len * attention_head_size_, 
+        &beta_zero, 
+        (float*)grad_v_reshaped.d_ptr(), (long long)seq_len * attention_head_size_,
+        batch_size * num_attention_heads_));
 
     // --- 3. Dropout 및 Softmax 역전파 ---
     dropout_.backward(stream, grad_attention_probs, grad_attention_probs, cache.attention_probs_dropout_cache);
     GpuTensor grad_scores;
     grad_scores.allocate(cache.attention_scores.dims());
-    launch_softmax_backward_kernel(stream, (float*)grad_scores.d_ptr_, (const float*)grad_attention_probs.d_ptr_, (const float*)cache.attention_probs.d_ptr_, batch_size * num_attention_heads_ * seq_len, seq_len);
+    
+    // *** 수정된 launch_softmax_backward_kernel 호출 ***
+    int M_softmax = batch_size * num_attention_heads_ * seq_len;
+    int N_softmax = seq_len;
+    launch_softmax_backward_kernel(stream,
+        (float*)grad_scores.d_ptr_,
+        (const float*)grad_attention_probs.d_ptr_,
+        (const float*)cache.attention_probs.d_ptr_,
+        M_softmax, N_softmax);
 
     // --- 4. 스케일링 역전파 ---
     const float scale_factor = 1.0f / sqrtf(static_cast<float>(attention_head_size_));
@@ -180,8 +203,25 @@ void BertSelfAttention::backward(rocblas_handle blas_handle, hipStream_t stream,
     GpuTensor grad_q_reshaped, grad_k_reshaped;
     grad_q_reshaped.allocate(cache.q_reshaped.dims());
     grad_k_reshaped.allocate(cache.k_reshaped.dims());
-    ROCBLAS_CHECK(rocblas_sgemm_strided_batched(blas_handle, rocblas_operation_none, rocblas_operation_none, seq_len, attention_head_size_, seq_len, &alpha, (const float*)grad_scores.d_ptr(), seq_len, (long long)seq_len * seq_len, (const float*)cache.k_reshaped.d_ptr(), attention_head_size_, (long long)seq_len * attention_head_size_, &beta_zero, (float*)grad_q_reshaped.d_ptr(), attention_head_size_, (long long)seq_len * attention_head_size_, batch_size * num_attention_heads_));
-    ROCBLAS_CHECK(rocblas_sgemm_strided_batched(blas_handle, rocblas_operation_transpose, rocblas_operation_none, seq_len, attention_head_size_, seq_len, &alpha, (const float*)grad_scores.d_ptr(), seq_len, (long long)seq_len * seq_len, (const float*)cache.q_reshaped.d_ptr(), attention_head_size_, (long long)seq_len * attention_head_size_, &beta_zero, (float*)grad_k_reshaped.d_ptr(), attention_head_size_, (long long)seq_len * attention_head_size_, batch_size * num_attention_heads_));
+
+    ROCBLAS_CHECK(rocblas_sgemm_strided_batched(blas_handle, rocblas_operation_none, rocblas_operation_none, 
+        seq_len, attention_head_size_, seq_len, 
+        &alpha, 
+        (const float*)grad_scores.d_ptr(), (long long)seq_len * seq_len,
+        (const float*)cache.k_reshaped.d_ptr(), (long long)seq_len * attention_head_size_, 
+        &beta_zero, 
+        (float*)grad_q_reshaped.d_ptr(), (long long)seq_len * attention_head_size_,
+        batch_size * num_attention_heads_));
+
+    ROCBLAS_CHECK(rocblas_sgemm_strided_batched(blas_handle, rocblas_operation_transpose, rocblas_operation_none, 
+        seq_len, attention_head_size_, seq_len, 
+        &alpha, 
+        (const float*)grad_scores.d_ptr(), (long long)seq_len * seq_len,
+        (const float*)cache.q_reshaped.d_ptr(), (long long)seq_len * attention_head_size_, 
+        &beta_zero, 
+        (float*)grad_k_reshaped.d_ptr(), (long long)seq_len * attention_head_size_,
+        batch_size * num_attention_heads_));
+
 
     // --- 6. Reshape 역전파 및 Q, K, V의 선형 투영 역전파 ---
     GpuTensor grad_q_proj, grad_k_proj, grad_v_proj;
@@ -192,6 +232,7 @@ void BertSelfAttention::backward(rocblas_handle blas_handle, hipStream_t stream,
     launch_transpose_back_kernel(stream, (float*)grad_k_proj.d_ptr_, (const float*)grad_k_reshaped.d_ptr_, batch_size, seq_len, num_attention_heads_, attention_head_size_);
     launch_transpose_back_kernel(stream, (float*)grad_v_proj.d_ptr_, (const float*)grad_v_reshaped.d_ptr_, batch_size, seq_len, num_attention_heads_, attention_head_size_);
     
+    // 그래디언트는 각 backward 호출 내부에서 grad_input_hidden_states에 누적됩니다.
     value_.backward(blas_handle, stream, grad_v_proj, cache.v_dense_cache, grad_input_hidden_states);
     key_.backward(blas_handle, stream, grad_k_proj, cache.k_dense_cache, grad_input_hidden_states);
     query_.backward(blas_handle, stream, grad_q_proj, cache.q_dense_cache, grad_input_hidden_states);
@@ -208,9 +249,6 @@ BertAttention::BertAttention(const BertConfig& config, const std::string& name_p
       output_layernorm_(config.hidden_size, config.layer_norm_eps, name_prefix + ".attention.output.LayerNorm")
       {}
 
-/**
- * @brief 이 모듈 및 하위 모듈의 모든 학습 파라미터를 반환합니다.
- */
 std::vector<Parameter*> BertAttention::get_parameters() {
     auto self_params = self_attention_.get_parameters();
     auto dense_params = output_dense_.get_parameters();
@@ -220,16 +258,17 @@ std::vector<Parameter*> BertAttention::get_parameters() {
     return self_params;
 }
 
-/**
- * @brief BertAttention 레이어 전체(Self-Attention + Output)의 순전파를 수행합니다.
- */
 void BertAttention::forward(rocblas_handle blas_handle, hipStream_t stream,
                            const GpuTensor& input_tensor,
                            const GpuTensor& attention_mask,
+                           GpuTensor& output_tensor, // 명시적 출력 텐서 사용
                            BertAttentionCache& cache,
                            bool is_training) {
     if (!input_tensor.is_allocated()) {
         throw std::runtime_error("Input tensor not allocated for BertAttention forward.");
+    }
+    if (!output_tensor.is_allocated() || output_tensor.dims() != input_tensor.dims()) {
+        output_tensor.allocate(input_tensor.dims());
     }
     cache.attention_input = &input_tensor;
 
@@ -237,8 +276,9 @@ void BertAttention::forward(rocblas_handle blas_handle, hipStream_t stream,
     self_attention_.forward(blas_handle, stream, input_tensor, attention_mask, cache.self_attention_cache, is_training);
 
     // --- 2. Self-Attention 출력에 대한 후처리 (Dense + Dropout) ---
-    GpuTensor dense_output;
+    GpuTensor dense_output; // 로컬 임시 텐서 사용
     dense_output.allocate(cache.self_attention_cache.context_layer.dims());
+
     output_dense_.forward(blas_handle, stream, cache.self_attention_cache.context_layer, dense_output, cache.output_dense_cache);
     output_dropout_.forward(stream, dense_output, cache.output_dropout_cache, is_training);
 
@@ -248,14 +288,10 @@ void BertAttention::forward(rocblas_handle blas_handle, hipStream_t stream,
     launch_elementwise_add_kernel(stream, (float*)attention_residual_sum_output.d_ptr(), (const float*)dense_output.d_ptr(), (const float*)input_tensor.d_ptr(), attention_residual_sum_output.num_elements_);
 
     // --- 4. 최종 Layer Normalization ---
-    // 최종 출력은 LayerNorm(잔차 연결 결과)입니다.
-    // BertLayer에서 사용하기 위해 출력을 cache.self_attention_cache.context_layer에 덮어씁니다. (이는 필드 재사용)
-    output_layernorm_.forward(stream, attention_residual_sum_output, cache.self_attention_cache.context_layer, cache.output_layernorm_cache);
+    // 최종 출력을 명시적 output_tensor에 저장
+    output_layernorm_.forward(stream, attention_residual_sum_output, output_tensor, cache.output_layernorm_cache);
 }
 
-/**
- * @brief BertAttention 레이어 전체의 역전파를 수행합니다.
- */
 void BertAttention::backward(rocblas_handle blas_handle, hipStream_t stream,
                             const GpuTensor& grad_final_output,
                             BertAttentionCache& cache,
@@ -267,31 +303,28 @@ void BertAttention::backward(rocblas_handle blas_handle, hipStream_t stream,
         grad_input_tensor.allocate(cache.attention_input->dims());
         grad_input_tensor.zero_out(stream);
     }
-
-    // --- 1. LayerNorm 역전파 ---
+    
+    // 1. LayerNorm 역전파
     GpuTensor grad_after_layernorm;
     grad_after_layernorm.allocate(grad_final_output.dims());
     output_layernorm_.backward(stream, grad_final_output, cache.output_layernorm_cache, grad_after_layernorm);
 
-    // --- 2. Dropout 역전파 ---
+    // 2. Dropout 역전파
     GpuTensor grad_after_dropout;
     grad_after_dropout.allocate(grad_after_layernorm.dims());
     output_dropout_.backward(stream, grad_after_dropout, grad_after_layernorm, cache.output_dropout_cache);
 
-    // --- 3. Dense (출력) 역전파 ---
+    // 3. Dense (출력) 역전파
     GpuTensor grad_after_dense;
-    grad_after_dense.allocate(grad_after_dropout.dims());
+    // grad_after_dense는 self-attention의 출력(context_layer)에 대한 그래디언트
+    grad_after_dense.allocate(cache.self_attention_cache.context_layer.dims());
     output_dense_.backward(blas_handle, stream, grad_after_dropout, cache.output_dense_cache, grad_after_dense);
-
-    // --- 4. SelfAttention 역전파 ---
-    // grad_after_dense는 self_attention 모듈의 출력에 대한 그래디언트입니다.
-    // self_attention_.backward는 계산된 그래디언트를 grad_input_tensor에 **누적**합니다.
+    
+    // 4. SelfAttention 역전파
     self_attention_.backward(blas_handle, stream, grad_after_dense, cache.self_attention_cache, grad_input_tensor);
 
-    // --- 5. 잔차 연결(Residual Connection) 역전파 [핵심] ---
-    // LayerNorm 역전파의 결과(grad_after_layernorm)는 합산 연산의 출력에 대한 그래디언트이므로,
-    // 합산의 두 입력(attention output, original input) 모두에 전달되어야 합니다.
-    // original input 경로의 그래디언트를 최종 입력 그래디언트에 더해줍니다.
+    // 5. 잔차 연결(Residual Connection) 역전파
+    // LayerNorm의 역전파 결과(grad_after_layernorm)는 덧셈 연산의 두 입력 모두에 전달되어야 함
     launch_accumulate_kernel(stream,
                              (float*)grad_input_tensor.d_ptr(),
                              (const float*)grad_after_layernorm.d_ptr(),
