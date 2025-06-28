@@ -21,7 +21,7 @@
 #define ROCBLAS_CHECK(cmd) do { \
     rocblas_status err = cmd; \
     if (err != rocblas_status_success) { \
-        fprintf(stderr, "rocBLAS Error: %d in %s at line %d\n", err, __FILE__, __LINE__); \
+        fprintf(stderr, "rocBLAS Error: %s (%d) in %s at line %d\n", rocblas_status_to_string(err), err, __FILE__, __LINE__); \
         throw std::runtime_error("rocBLAS error"); \
     } \
 } while(0)
@@ -31,7 +31,7 @@ enum class DataType { FLOAT32, INT32 };
 
 // --- 전방 선언 ---
 class Parameter;
-struct BertConfig; // Defined in bert_components_hip.hpp
+struct BertConfig;
 
 // --- GpuTensor: GPU 메모리를 관리하는 텐서 클래스 ---
 class GpuTensor {
@@ -43,16 +43,22 @@ public:
     std::string name_;
     bool allocated_ = false;
     DataType dtype = DataType::FLOAT32;
+    bool is_view_ = false; // 뷰(View) 여부 플래그 추가
 
     GpuTensor(const std::string& name = "");
     GpuTensor(const std::vector<int>& dimensions, const std::string& name = "", DataType type = DataType::FLOAT32);
     ~GpuTensor();
+
+    // 복사 생성자 및 대입 연산자 삭제
     GpuTensor(const GpuTensor&) = delete;
     GpuTensor& operator=(const GpuTensor&) = delete;
+
+    // 이동 생성자 및 대입 연산자
     GpuTensor(GpuTensor&& other) noexcept;
     GpuTensor& operator=(GpuTensor&& other) noexcept;
 
     void allocate(const std::vector<int>& new_dims);
+    void set_view(void* ptr, const std::vector<int>& dims, DataType type = DataType::FLOAT32); // 뷰 설정 함수 추가
     void free();
     void zero_out(hipStream_t stream);
 
@@ -84,4 +90,4 @@ public:
     void allocate_gradients();
 };
 
-#endif // COMMON_HIP_HPP
+#endif 
