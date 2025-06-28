@@ -136,6 +136,7 @@ public:
     void forward(rocblas_handle blas_handle, hipStream_t stream,
                  const GpuTensor& input_tensor,
                  const GpuTensor& attention_mask,
+                 GpuTensor& output_tensor, // Output tensor
                  BertAttentionCache& cache,
                  bool is_training);
 

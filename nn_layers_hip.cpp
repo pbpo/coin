@@ -158,19 +158,10 @@ void DenseLayer::forward(rocblas_handle blas_handle, hipStream_t stream,
 
     // Now, `cache.output_before_gelu` holds the value that will be fed into GELU.
     // Apply GELU to `cache.output_before_gelu` and store the result in the final `output` tensor.
-    // This requires a GELU-only kernel. We can use `launch_add_bias_gelu_kernel` with a zero bias.
-    GpuTensor dummy_zero_bias; // Create a dummy zero bias tensor for the GELU call.
-    if (N > 0) {
-      dummy_zero_bias.allocate({N});
-      dummy_zero_bias.zero_out(stream);
-      HIP_CHECK(hipStreamSynchronize(stream)); // Ensure zero_out completes before use
-    }
-
-    launch_add_bias_gelu_kernel(stream,
-                               (float*)output.d_ptr(), // Final output
-                               (const float*)cache.output_before_gelu.d_ptr(), // Input to GELU
-                               (const float*)(N > 0 ? dummy_zero_bias.d_ptr_ : nullptr), // Zero bias, handle N=0 case
-                               M, N);
+    launch_gelu_forward_kernel(stream,
+                               (float*)output.d_ptr(),
+                               (const float*)cache.output_before_gelu.d_ptr(),
+                               output.num_elements_);
 
     cache.input_to_gemm = &input; // Store original input to GEMM for backward pass
 }

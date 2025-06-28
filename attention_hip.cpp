@@ -226,31 +226,42 @@ std::vector<Parameter*> BertAttention::get_parameters() {
 void BertAttention::forward(rocblas_handle blas_handle, hipStream_t stream,
                            const GpuTensor& input_tensor,
                            const GpuTensor& attention_mask,
+                           GpuTensor& output_tensor, // Output tensor
                            BertAttentionCache& cache,
                            bool is_training) {
     if (!input_tensor.is_allocated()) {
         throw std::runtime_error("Input tensor not allocated for BertAttention forward.");
     }
+    // output_tensor는 호출자에 의해 input_tensor와 동일한 차원으로 할당되어야 합니다.
+    if (!output_tensor.is_allocated() || output_tensor.dims_ != input_tensor.dims_) {
+         throw std::runtime_error("Output tensor not properly allocated for BertAttention forward.");
+    }
     cache.attention_input = &input_tensor;
 
     // --- 1. Self-Attention 수행 ---
+    // self_attention_의 출력은 cache.self_attention_cache.context_layer에 저장됨
     self_attention_.forward(blas_handle, stream, input_tensor, attention_mask, cache.self_attention_cache, is_training);
 
     // --- 2. Self-Attention 출력에 대한 후처리 (Dense + Dropout) ---
     GpuTensor dense_output;
     dense_output.allocate(cache.self_attention_cache.context_layer.dims());
     output_dense_.forward(blas_handle, stream, cache.self_attention_cache.context_layer, dense_output, cache.output_dense_cache);
+
+    // Dropout은 dense_output을 in-place로 수정
     output_dropout_.forward(stream, dense_output, cache.output_dropout_cache, is_training);
 
     // --- 3. 잔차 연결 (Residual Connection) ---
-    GpuTensor attention_residual_sum_output;
+    GpuTensor attention_residual_sum_output; // 임시 텐서
     attention_residual_sum_output.allocate(dense_output.dims());
-    launch_elementwise_add_kernel(stream, (float*)attention_residual_sum_output.d_ptr(), (const float*)dense_output.d_ptr(), (const float*)input_tensor.d_ptr(), attention_residual_sum_output.num_elements_);
+    launch_elementwise_add_kernel(stream,
+                                  (float*)attention_residual_sum_output.d_ptr(),
+                                  (const float*)dense_output.d_ptr(), // Dropout이 적용된 dense_output 사용
+                                  (const float*)input_tensor.d_ptr(),
+                                  attention_residual_sum_output.num_elements_);
 
     // --- 4. 최종 Layer Normalization ---
-    // 최종 출력은 LayerNorm(잔차 연결 결과)입니다.
-    // BertLayer에서 사용하기 위해 출력을 cache.self_attention_cache.context_layer에 덮어씁니다. (이는 필드 재사용)
-    output_layernorm_.forward(stream, attention_residual_sum_output, cache.self_attention_cache.context_layer, cache.output_layernorm_cache);
+    // 최종 출력은 output_tensor에 저장됩니다.
+    output_layernorm_.forward(stream, attention_residual_sum_output, output_tensor, cache.output_layernorm_cache);
 }
 
 /**

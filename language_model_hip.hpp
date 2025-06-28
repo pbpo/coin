@@ -38,8 +38,7 @@ private:
     const BertConfig& config_; // Store by reference
 
     // "transform" part (Dense -> Activation -> LayerNorm)
-    DenseLayer transform_dense_;
-    // Gelu transform_act_fn_; // Original code had this separate
+    DenseLayer transform_dense_; // DenseLayer now incorporates GELU activation
     LayerNorm transform_layernorm_;
 
     // "decoder" part (usually a Dense layer without activation, whose weights are tied to word_embeddings)

@@ -46,8 +46,8 @@ struct BertLayerCache {
     BertAttentionCache attention_cache; // Cache for the BertAttention sub-module
 
     // Feed-Forward Network (FFN) part
-    DenseLayerCache ffn_intermediate_dense_cache; // For the first dense layer in FFN
-    GeluCache ffn_gelu_cache;                     // For GELU activation
+    DenseLayerCache ffn_intermediate_dense_cache; // For the first dense layer in FFN (which includes GELU)
+    // GeluCache ffn_gelu_cache;                  // No longer needed as DenseLayer incorporates GELU and its cache requirements.
     DenseLayerCache ffn_output_dense_cache;       // For the second dense layer (output) in FFN
     DropoutCache ffn_output_dropout_cache;        // Dropout after FFN dense output
     LayerNormCache ffn_output_layernorm_cache;    // LayerNorm after FFN and residual
@@ -117,7 +117,7 @@ private:
 
     // FFN (BertIntermediate and BertOutput)
     DenseLayer ffn_intermediate_dense_; // BertIntermediate
-    Gelu ffn_activation_;              // GELU is separate in HF, but often fused or follows dense
+    // Gelu ffn_activation_;              // GELU is separate in HF, but often fused or follows dense. DenseLayer now incorporates GELU.
     DenseLayer ffn_output_dense_;       // BertOutput dense part
     Dropout ffn_output_dropout_;
     LayerNorm ffn_output_layernorm_;   // LayerNorm for the FFN output + residual
