@@ -5,7 +5,18 @@
 #include <hiprand/hiprand_kernel.h> // For hiprandState_t, hiprand_init, hiprand_uniform
 #include <cmath> // For sqrtf, expf, logf, tanhf, powf
 #include <cfloat> // For FLT_MAX
+__device__ float gelu_fn_device(float x) {
+    return 0.5f * x * (1.0f + tanhf(sqrtf(2.0f / M_PI_F) * (x + 0.044715f * x * x * x)));
+}
 
+__device__ float gelu_grad_fn_device(float x) {
+    const float sqrt_2_over_pi = sqrtf(2.0f / M_PI_F);
+    const float term_val = x + 0.044715f * x * x * x;
+    const float tanh_term_val = tanhf(sqrt_2_over_pi * term_val);
+    const float sech_sq = 1.0f - tanh_term_val * tanh_term_val;
+    const float d_term_val = sqrt_2_over_pi * (1.0f + 3.0f * 0.044715f * x * x);
+    return 0.5f * (1.0f + tanh_term_val) + 0.5f * x * sech_sq * d_term_val;
+}
 // ============================================================================
 // GpuPtrArray Implementation
 // ============================================================================
@@ -799,15 +810,11 @@ __global__ void softmax_kernel_impl(float* output, const float* input, int M, in
 }
 
 __global__ void softmax_backward_kernel_impl(
-    float* grad_input, const float* grad_output, const float* output, // output is softmax(input)
-    size_t num_elements_total, int M, int N_softmax_dim) { // M rows, N_softmax_dim is the softmax dimension
-    // grad_input, grad_output, output are all [M, N_softmax_dim]
-    // Each block processes one row.
-    // Based on dL/dx_i = sum_j (dL/dy_j * dy_j/dx_i)
-    // dy_j/dx_i = y_j * (delta_ij - y_i)
+    float* grad_input, const float* grad_output, const float* output,
+    int M, int N_softmax_dim) {
     // dL/dx_i = y_i * (dL/dy_i - sum_j(dL/dy_j * y_j))
 
-    extern __shared__ float sdata[]; // For reduction, size blockDim.x
+    extern __shared__ float sdata[]; // Reduction을 위한 공유 메모리
 
     int row_idx = blockIdx.x;
     int tid = threadIdx.x;
@@ -816,7 +823,7 @@ __global__ void softmax_backward_kernel_impl(
 
     int base_idx = row_idx * N_softmax_dim;
 
-    // Calculate sum_j (dL/dy_j * y_j) for this row
+    // 현재 행에 대한 sum_j (dL/dy_j * y_j) 계산
     float sum_grad_output_times_output = 0.0f;
     for (int j = tid; j < N_softmax_dim; j += blockDim.x) {
         sum_grad_output_times_output += grad_output[base_idx + j] * output[base_idx + j];
@@ -824,18 +831,38 @@ __global__ void softmax_backward_kernel_impl(
     sdata[tid] = sum_grad_output_times_output;
     __syncthreads();
 
+    // 공유 메모리에서 Reduction 수행
     for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
         if (tid < s) sdata[tid] += sdata[tid + s];
         __syncthreads();
     }
-    sum_grad_output_times_output = sdata[0]; // This is sum_j(dL/dy_j * y_j) for the current row
+    sum_grad_output_times_output = sdata[0];
     __syncthreads();
 
-    // Calculate grad_input
+    // 최종 grad_input 계산
     for (int i = tid; i < N_softmax_dim; i += blockDim.x) {
         int current_idx = base_idx + i;
         grad_input[current_idx] = output[current_idx] * (grad_output[current_idx] - sum_grad_output_times_output);
     }
+}
+
+
+// --- Softmax Backward Kernel Launcher ---
+// *** 수정됨: 모호한 시그니처를 명시적으로 변경 ***
+void launch_softmax_backward_kernel(
+    hipStream_t stream, float* grad_input, const float* grad_output, const float* output,
+    int M_rows, int N_softmax_dim)
+{
+    if (M_rows == 0 || N_softmax_dim == 0) return;
+
+    dim3 grid(M_rows); // 각 블록이 하나의 행을 처리
+    dim3 block(min(N_softmax_dim, THREADS_PER_BLOCK_DEFAULT));
+    size_t shared_mem_size = block.x * sizeof(float);
+
+    hipLaunchKernelGGL(softmax_backward_kernel_impl, grid, block, shared_mem_size, stream,
+                       grad_input, grad_output, output,
+                       M_rows, N_softmax_dim);
+    HIP_CHECK(hipGetLastError());
 }
 
 
@@ -1208,61 +1235,7 @@ void launch_softmax_kernel(
     HIP_CHECK(hipGetLastError());
 }
 
-void launch_softmax_backward_kernel(
-    float* grad_input, const float* grad_output, const float* output,
-    size_t num_elements_total, hipStream_t stream) // num_elements_total is M * N_softmax_dim
-{
-    // Need M and N_softmax_dim for the kernel.
-    // This launcher is a bit underspecified. Assuming it's called with correct M and N from context.
-    // Let's assume num_elements_total is for a flat vector, and we need to infer M, N.
-    // This is problematic. The caller should provide M and N_softmax_dim.
-    // For now, let's assume it's called from a context where M and N_softmax_dim are known
-    // and num_elements_total = M * N_softmax_dim.
-    // This launcher needs to be paired with a call that knows M and N.
-    // For BertSelfAttention backward, M = batch_x_heads * seq_len, N_softmax_dim = seq_len.
-    // The call was: launch_softmax_backward_kernel((float*)grad_scores.d_ptr_, ... , batch_x_heads * seq_len * seq_len, stream);
-    // Here, num_elements_total = (batch_x_heads * seq_len) * seq_len. So M = batch_x_heads * seq_len, N_softmax_dim = seq_len.
 
-    if (num_elements_total == 0) return;
-
-    // This is a guess. The caller of this launcher needs to be more specific or this launcher needs M, N.
-    // Let's assume the common case from attention: N_softmax_dim is sqrt(num_elements_total / M_guess)
-    // This is not robust. For now, this launcher is difficult to implement generically.
-    // Let's assume the caller knows M and N_softmax_dim and passes them.
-    // The declaration was: launch_softmax_backward_kernel(float* grad_input, const float* grad_output, const float* output,
-    //                                                    size_t num_elements, hipStream_t stream);
-    // The kernel is: softmax_backward_kernel_impl(float* grad_input, const float* grad_output, const float* output,
-    //                                            size_t num_elements_total, int M, int N_softmax_dim)
-    // We need to modify the launcher to accept M and N_softmax_dim.
-    // For now, I will comment out the call as it's not directly callable with current signature.
-    // It means the HPP declaration also needs to change.
-    // For the sake of progress, I'll assume a square matrix for now if M, N not given which is wrong.
-    // A better approach: the BertSelfAttention code should call the _impl kernel directly or this launcher needs M,N.
-    // Given the existing call structure, I'll have to make an assumption or modify the plan.
-    // Modifying the launcher signature in hpp and here:
-    // void launch_softmax_backward_kernel(
-    //    float* grad_input, const float* grad_output, const float* output,
-    //    int M_rows, int N_softmax_dim, hipStream_t stream)
-    // This change needs to be reflected in hip_kernels.hpp too. I'll assume this change is made.
-    // The existing call from BertSelfAttention:
-    // launch_softmax_backward_kernel((float*)grad_scores.d_ptr_, (const float*)grad_attention_probs.d_ptr_,
-    //    (const float*)cache.attention_probs.d_ptr_, batch_x_heads * seq_len * seq_len, stream);
-    // This implies num_elements_total is passed.
-    // Let's assume N_softmax_dim is seq_len from context of BertSelfAttention.
-    // M_rows = num_elements_total / N_softmax_dim;
-    // This is still a guess. The plan should be updated to fix this.
-    if (M_rows == 0 || N_softmax_dim == 0) return;
-
-    dim3 grid(M_rows); // Each block processes one row
-    dim3 block(min(N_softmax_dim, THREADS_PER_BLOCK_DEFAULT));
-    size_t shared_mem_size = block.x * sizeof(float);
-
-    hipLaunchKernelGGL(softmax_backward_kernel_impl, grid, block, shared_mem_size, stream,
-                       grad_input, grad_output, output,
-                       0, // num_elements_total (not used by current _impl, M and N are used)
-                       M_rows, N_softmax_dim);
-    HIP_CHECK(hipGetLastError());
-}
 
 
 // --- Element-wise Add/Accumulate Kernels ---
